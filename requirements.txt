@@ -1,0 +1,4 @@
+numpy>=1.24
+opencv-python>=4.5
+PyQt5>=5.15
+rosbags>=0.10
