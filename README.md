@@ -1,4 +1,4 @@
-# bag_dataset_maker
+# bag_labeler
 
 rosbag2 (`.db3`) の映像とセンサの時系列グラフを見ながらラベル区間を付け、
 `elapsed, データ軸..., label` 形式の CSV データセットを作る GUI ツール。
@@ -94,7 +94,7 @@ pip install -r requirements.txt
 | `<bag名>_dataset.csv` | データセット |
 | `<bag名>_labels.json` | ラベル区間と映像オフセット。変更のたびに自動保存され、bag を開き直すと復元される |
 
-起動時に指定したディレクトリには `.bag_dataset_maker.json` (選択した列・プロット・停止ボタン等の設定) を保存する。
+起動時に指定したディレクトリには `.bag_labeler.json` (選択した列・プロット・停止ボタン等の設定) を保存する。
 
 ### CSV の形式
 
@@ -131,6 +131,6 @@ df['label'] = df.label.replace({2: 1}) # 接触しているかを判定する 2 
 
 | ファイル | 内容 |
 |---|---|
-| `bag_dataset_maker.py` | GUI |
+| `bag_labeler.py` | GUI |
 | `bag_core.py` | bag の読み込み・区間の判定・CSV 生成 (GUI 非依存) |
 | `launch.bash` | 起動スクリプト |

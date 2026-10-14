@@ -2,7 +2,7 @@
 """rosbag2 (.db3) を映像で確認しながらラベル付けし、CSV データセットを作る GUI.
 
 使い方:
-    python3 bag_dataset_maker.py [探索ルート (既定: カレントディレクトリ)]
+    python3 bag_labeler.py [探索ルート (既定: カレントディレクトリ)]
 
 キー操作:
     ← / →            1 フレーム移動 (Shift で 10 フレーム)
@@ -38,7 +38,7 @@ from PyQt5.QtWidgets import (
 
 import bag_core as bc
 
-CONFIG_NAME = '.bag_dataset_maker.json'
+CONFIG_NAME = '.bag_labeler.json'
 # 映像同期 (S キー) で停止時刻を求める速度トピック
 SPEED_TOPIC = '/odom'
 SPEED_FIELDS = ['twist.twist.linear.x', 'twist.twist.angular.z']
@@ -310,7 +310,7 @@ class MainWindow(QMainWindow):
         self.play_origin = (0.0, 0)
         self._building_tree = False
 
-        self.setWindowTitle(f'Bag Dataset Maker - {root}')
+        self.setWindowTitle(f'Bag Labeler - {root}')
         self.resize(1500, 900)
         self._build_ui()
         self._scan_bags()
