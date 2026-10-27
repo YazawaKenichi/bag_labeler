@@ -11,8 +11,6 @@
     Enter            現在フレームからラベル区間を開始. 終了は「区間の終了」設定による.
                      既定では odom 停止までを label、その後 bag 末尾までを label 2 にする
     E                選択中 (未選択なら最後) の区間の終了を現在フレームにする
-    S                映像でロボットが止まったフレームで押すと、odom の停止時刻に合うよう
-                     映像オフセットを設定する (カメラ遅延の補正)
     Delete           選択中の区間を削除
     Ctrl+S           CSV 保存
 """
@@ -39,7 +37,7 @@ from PyQt5.QtWidgets import (
 import bag_core as bc
 
 CONFIG_NAME = '.bag_labeler.json'
-# 映像同期 (S キー) で停止時刻を求める速度トピック
+# 映像同期 (「odom 停止に合わせる」ボタン) で停止時刻を求める速度トピック
 SPEED_TOPIC = '/odom'
 SPEED_FIELDS = ['twist.twist.linear.x', 'twist.twist.angular.z']
 DEFAULT_PLOTS = ['/hx711/raw|data', '/cmd_vel|linear.x', '/cmd_vel|angular.z', '/joy|buttons[5]']
@@ -55,6 +53,24 @@ STOP_SOURCE_NAMES = {'joy': '停止ボタン', 'odom': 'odom 停止', 'manual': 
                      'bag_end': '未設定 (bag 末尾まで)'}
 INTERVAL_COLORS = [QColor(66, 165, 245, 90), QColor(255, 167, 38, 90),
                    QColor(102, 187, 106, 90), QColor(171, 71, 188, 90)]
+# 映像の表示調整 (設定キー, 表示名, 最小, 最大, 既定, 値の表示). プレビューにだけ反映する
+VIEW_ADJUST = [('view_brightness', '明るさ', -100, 100, 0, lambda v: f'{v:+d}'),
+               ('view_contrast', 'コントラスト', 0, 300, 100, lambda v: f'{v} %'),
+               ('view_gamma', 'ガンマ', 10, 300, 100, lambda v: f'{v / 100:.2f}')]
+
+
+def adjust_lut(brightness: int, contrast: int, gamma: int) -> np.ndarray | None:
+    """明るさ・コントラスト・ガンマを 8bit の変換表にする. 無変換なら None.
+
+    ガンマ (1 より大きいと中間調が明るくなる) → コントラスト (中央の灰色を中心に拡大)
+    → 明るさ (全体に加算) の順に適用する。
+    """
+    if (brightness, contrast, gamma) == (0, 100, 100):
+        return None
+    x = np.arange(256) / 255.0
+    y = x ** (100.0 / gamma)
+    y = (y - 0.5) * contrast / 100.0 + 0.5 + brightness / 100.0
+    return np.clip(y * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
 class Timeline(QWidget):
@@ -304,7 +320,8 @@ class MainWindow(QMainWindow):
         self.intervals: list[bc.Interval] = []
         self.video_offset = 0.0  # [s] 映像の記録時刻 - 実際の時刻 (カメラ遅延)
         self.frame = 0
-        self.img_cache: dict[int, QPixmap] = {}
+        self.img_cache: dict[int, np.ndarray] = {}  # デコード済み RGB (表示調整前)
+        self.view_lut: np.ndarray | None = None
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._play_tick)
         self.play_origin = (0.0, 0)
@@ -323,6 +340,7 @@ class MainWindow(QMainWindow):
                     'joy_topic': '/joy', 'joy_kind': 'buttons', 'joy_index': 5,
                     'joy_threshold': 0.5, 'label': 1, 'plot_field': '', 'video_offset': 0.0, 'end_mode': 'odom_then_after',
                     'plots': list(DEFAULT_PLOTS), 'plot_window': 0.0, 'plot_open': True}
+        defaults.update({key: default for key, _, _, _, default, _ in VIEW_ADJUST})
         try:
             defaults.update(json.loads(self.config_path.read_text()))
         except (OSError, ValueError):
@@ -444,9 +462,16 @@ class MainWindow(QMainWindow):
         self.offset_spin.setDecimals(3)
         self.offset_spin.setSingleStep(0.01)
         self.offset_spin.setSuffix(' s')
-        self.offset_spin.setToolTip('映像を何秒前にずらしてデータと合わせるか (カメラ遅延)。'
-                                    'S キーで odom の停止時刻から自動設定')
+        self.offset_spin.setToolTip('映像を何秒前にずらしてデータと合わせるか (カメラ遅延)')
         self.offset_spin.valueChanged.connect(self._set_offset)
+        btn_sync = QPushButton('odom 停止に合わせる')
+        btn_sync.setFocusPolicy(Qt.NoFocus)
+        btn_sync.setToolTip('映像でロボットが止まったフレームで押すと、'
+                            'odom の停止時刻に合うよう映像オフセットを設定する')
+        btn_sync.clicked.connect(self._sync_offset)
+        oh = QHBoxLayout()
+        oh.addWidget(self.offset_spin, 1)
+        oh.addWidget(btn_sync)
         self.ref_combo = QComboBox()
         self.ref_combo.currentTextChanged.connect(self._on_ref_topic)
         self.plot_combo = QComboBox()
@@ -477,7 +502,7 @@ class MainWindow(QMainWindow):
         settings = QGroupBox('設定')
         form = QFormLayout(settings)
         form.addRow('映像トピック', self.image_combo)
-        form.addRow('映像オフセット (S)', self.offset_spin)
+        form.addRow('映像オフセット', oh)
         form.addRow('基準トピック (行)', self.ref_combo)
         form.addRow('波形表示', self.plot_combo)
         form.addRow('停止ボタン トピック', self.joy_topic)
@@ -492,6 +517,29 @@ class MainWindow(QMainWindow):
                                  '既に作った区間には影響しない')
         form.addRow('区間の終了', self.end_mode)
 
+        view_box = QGroupBox('映像の表示調整 (プレビューのみ)')
+        vform = QFormLayout(view_box)
+        self.view_sliders = {}
+        for key, name, lo, hi, _, fmt in VIEW_ADJUST:
+            sl = QSlider(Qt.Horizontal)
+            sl.setRange(lo, hi)
+            sl.setFocusPolicy(Qt.NoFocus)
+            sl.setValue(int(self.config[key]))
+            sl.valueChanged.connect(self._on_view_adjust)
+            val = QLabel()
+            val.setMinimumWidth(50)
+            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            row = QHBoxLayout()
+            row.addWidget(sl, 1)
+            row.addWidget(val)
+            vform.addRow(name, row)
+            self.view_sliders[key] = (sl, val, fmt)
+        btn_reset = QPushButton('リセット')
+        btn_reset.setFocusPolicy(Qt.NoFocus)
+        btn_reset.clicked.connect(self._reset_view_adjust)
+        vform.addRow(btn_reset)
+        self._on_view_adjust()
+
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText('フィールド絞り込み')
         self.filter_edit.textChanged.connect(self._apply_filter)
@@ -504,6 +552,7 @@ class MainWindow(QMainWindow):
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.addWidget(settings)
+        rv.addWidget(view_box)
         rv.addWidget(QLabel('左の列: CSV に出力するデータ軸 / 右の列: プロット表示'))
         rv.addWidget(self.filter_edit)
         rv.addWidget(self.tree, 1)
@@ -547,8 +596,6 @@ class MainWindow(QMainWindow):
             self._add_interval()
         elif key == Qt.Key_E and not mod:
             self._set_end_here()
-        elif key == Qt.Key_S and not mod:
-            self._sync_offset()
         elif key in (Qt.Key_Delete, Qt.Key_Backspace):
             self._delete_interval()
         else:
@@ -789,6 +836,27 @@ class MainWindow(QMainWindow):
         self._cfg('plot_window', self.plot_panel.window)
         self.plot_panel.update()
 
+    # ------------------------------------------------------------ 映像の表示調整
+
+    def _on_view_adjust(self, _=None):
+        vals = {}
+        for key, (sl, val, fmt) in self.view_sliders.items():
+            vals[key] = sl.value()
+            val.setText(fmt(sl.value()))
+            self.config[key] = sl.value()
+        self._save_config()
+        self.view_lut = adjust_lut(vals['view_brightness'], vals['view_contrast'],
+                                   vals['view_gamma'])
+        self._show_current_image()
+
+    def _reset_view_adjust(self):
+        for key, _, _, _, default, _ in VIEW_ADJUST:
+            sl = self.view_sliders[key][0]
+            sl.blockSignals(True)
+            sl.setValue(default)
+            sl.blockSignals(False)
+        self._on_view_adjust()
+
     def _show_current_image(self):
         if self.bag is not None and self._n_frames():
             self._show_image(self.frame)
@@ -845,18 +913,20 @@ class MainWindow(QMainWindow):
         self._update_info(t)
 
     def _show_image(self, i: int):
-        pm = self.img_cache.get(i)
-        if pm is None:
+        rgb = self.img_cache.get(i)
+        if rgb is None:
             arr = bc.decode_image(self._images(), i)
             if arr is None:
                 self.video.setText('画像をデコードできません')
                 return
             rgb = np.ascontiguousarray(arr[:, :, ::-1])
-            h, w, _ = rgb.shape
-            pm = QPixmap.fromImage(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy())
             if len(self.img_cache) > 200:
                 self.img_cache.clear()
-            self.img_cache[i] = pm
+            self.img_cache[i] = rgb
+        if self.view_lut is not None:
+            rgb = self.view_lut[rgb]  # 表示用のコピーにだけ適用する
+        h, w, _ = rgb.shape
+        pm = QPixmap.fromImage(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy())
         self.video.setPixmap(pm.scaled(self.video.size(), Qt.KeepAspectRatio,
                                        Qt.SmoothTransformation))
 
